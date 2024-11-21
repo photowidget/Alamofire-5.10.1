@@ -25,6 +25,7 @@
 #if canImport(_Concurrency)
 
 import Foundation
+import Combine
 
 // MARK: - Request Event Streams
 
@@ -116,14 +117,23 @@ public struct DataTask<Value>: Sendable where Value: Sendable {
     /// `DataResponse` produced by the `DataRequest` and its response handler.
     public var response: DataResponse<Value, AFError> {
         get async {
-            if shouldAutomaticallyCancel {
-                await withTaskCancellationHandler {
-                    await task.value
-                } onCancel: {
-                    cancel()
+            if !isExactlyiOS180() {
+                if shouldAutomaticallyCancel {
+                    return await withTaskCancellationHandler {
+                        await task.value
+                    } onCancel: {
+                        cancel()
+                    }
+                } else {
+                    return await task.value
                 }
             } else {
-                await task.value
+                if shouldAutomaticallyCancel {
+                    if Task.isCancelled {
+                        cancel()
+                    }
+                }
+                return await task.value
             }
         }
     }
@@ -348,19 +358,35 @@ extension DataRequest {
     private func dataTask<Value>(automaticallyCancelling shouldAutomaticallyCancel: Bool,
                                  forResponse onResponse: @Sendable @escaping (@escaping @Sendable (DataResponse<Value, AFError>) -> Void) -> Void)
         -> DataTask<Value> {
-        let task = Task {
-            await withTaskCancellationHandler {
-                await withCheckedContinuation { continuation in
-                    onResponse {
-                        continuation.resume(returning: $0)
+        if !isExactlyiOS180() {
+            let task = Task {
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        onResponse {
+                            continuation.resume(returning: $0)
+                        }
                     }
+                } onCancel: {
+                    self.cancel()
                 }
-            } onCancel: {
-                self.cancel()
             }
+            return DataTask<Value>(request: self, task: task, shouldAutomaticallyCancel: shouldAutomaticallyCancel)
+        } else {
+            let task = Task {
+                let response = await Task { () -> DataResponse<Value, AFError> in
+                    var result: DataResponse<Value, AFError>!
+                    let semaphore = DispatchSemaphore(value: 0)
+                    onResponse { response in
+                        result = response
+                        semaphore.signal()
+                    }
+                    semaphore.wait()
+                    return result
+                }.value
+                return response
+            }
+            return DataTask<Value>(request: self, task: task, shouldAutomaticallyCancel: shouldAutomaticallyCancel)
         }
-
-        return DataTask<Value>(request: self, task: task, shouldAutomaticallyCancel: shouldAutomaticallyCancel)
     }
 }
 
@@ -960,3 +986,19 @@ public struct StreamOf<Element>: AsyncSequence {
 }
 
 #endif
+
+private func isExactlyiOS180() -> Bool {
+    if #available(iOS 18.0, *) {
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+        if osVersion.majorVersion == 18 && osVersion.minorVersion == 0 {
+            // 정확히 iOS 18.0
+            return true
+        } else {
+            // iOS 18.0 이상 (18.0 초과)
+            return false
+        }
+    } else {
+        // iOS 18.0 미만
+        return false
+    }
+}
